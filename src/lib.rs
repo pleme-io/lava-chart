@@ -253,6 +253,17 @@ fn value_tree_from_sx(sx: &Sx) -> Result<ValueTree, ChartParseError> {
     if let Some(i) = sx.as_int() {
         return Ok(ValueTree::Int(i));
     }
+    // Recognize `true` / `false` symbols as booleans; lava-eval
+    // parses them as bare symbols, but YAML consumers want typed
+    // booleans (e.g. `enabled: true` not `enabled: 'true'`).
+    if let Some(sym) = sx.as_sym() {
+        if sym == "true" {
+            return Ok(ValueTree::Bool(true));
+        }
+        if sym == "false" {
+            return Ok(ValueTree::Bool(false));
+        }
+    }
     if let Some(xs) = sx.as_list() {
         if xs.is_empty() {
             return Ok(ValueTree::Null);
@@ -343,7 +354,15 @@ fn value_tree_to_yaml(v: &ValueTree, camel: bool) -> YamlValue {
         ValueTree::Null => YamlValue::Null,
         ValueTree::Bool(b) => YamlValue::Bool(*b),
         ValueTree::Int(i) => YamlValue::Number((*i).into()),
-        ValueTree::Str(s) => YamlValue::String(s.clone()),
+        ValueTree::Str(s) => {
+            // YAML quoting heuristic: bare 'true'/'false' would parse
+            // as booleans on re-read, so quote them as strings.
+            if matches!(s.as_str(), "true" | "false") {
+                YamlValue::String(s.clone())
+            } else {
+                YamlValue::String(s.clone())
+            }
+        }
         ValueTree::Ref { paths } => {
             // refs inside values.yaml are literal defaults — render the
             // first path segment unchanged.
@@ -406,16 +425,23 @@ fn ensure_metadata_name(metadata: &ValueTree, default_name: &str) -> YamlValue {
         .or_insert_with(|| ValueTree::Str(default_name.to_string()));
     let mut out = serde_yaml::Mapping::new();
     for (k, v) in &base {
+        // Metadata fields are camelCase K8s API; use the same
+        // manifest-side renderer so (ref :x) interpolations resolve
+        // as Helm templates.
         out.insert(
             YamlValue::String(kebab_to_camel(k)),
-            value_tree_to_yaml(v, /*camel*/ true),
+            manifest_value_to_yaml(v),
         );
     }
     YamlValue::Mapping(out)
 }
 
-/// Manifest spec rendering — keys kept as-authored (camelCase already
-/// because K8s API), Ref interpolation becomes `{{ .Values.<dot.path> }}`.
+/// Manifest spec rendering — K8s spec fields are camelCase by API
+/// convention (matchLabels, serviceAccountName, imagePullPolicy …),
+/// so apply kebab→camel here too. Single-path Ref renders as one
+/// `{{ .Values.<dot.path> }}` interpolation; multi-path Ref joins
+/// the rendered interpolations with `:` (the canonical separator
+/// for `image: repo:tag` style refs).
 fn manifest_value_to_yaml(v: &ValueTree) -> YamlValue {
     match v {
         ValueTree::Null => YamlValue::Null,
@@ -423,12 +449,14 @@ fn manifest_value_to_yaml(v: &ValueTree) -> YamlValue {
         ValueTree::Int(i) => YamlValue::Number((*i).into()),
         ValueTree::Str(s) => YamlValue::String(s.clone()),
         ValueTree::Ref { paths } => {
-            let dotted = paths
+            let rendered: Vec<String> = paths
                 .iter()
-                .map(|s| kebab_to_camel(s))
-                .collect::<Vec<_>>()
-                .join(".");
-            YamlValue::String(format!("{{{{ .Values.{dotted} }}}}"))
+                .map(|p| {
+                    let camel = p.split('.').map(kebab_to_camel).collect::<Vec<_>>().join(".");
+                    format!("{{{{ .Values.{camel} }}}}")
+                })
+                .collect();
+            YamlValue::String(rendered.join(":"))
         }
         ValueTree::List(items) => {
             YamlValue::Sequence(items.iter().map(manifest_value_to_yaml).collect())
@@ -436,7 +464,7 @@ fn manifest_value_to_yaml(v: &ValueTree) -> YamlValue {
         ValueTree::Map(m) => {
             let mut out = serde_yaml::Mapping::new();
             for (k, v) in m {
-                out.insert(YamlValue::String(k.clone()), manifest_value_to_yaml(v));
+                out.insert(YamlValue::String(kebab_to_camel(k)), manifest_value_to_yaml(v));
             }
             YamlValue::Mapping(out)
         }
@@ -573,5 +601,67 @@ mod tests {
         assert_eq!(kebab_to_camel("replica-count"), "replicaCount");
         assert_eq!(kebab_to_camel("a-b-c"), "aBC");
         assert_eq!(kebab_to_camel("single"), "single");
+    }
+
+    #[test]
+    fn manifest_spec_keys_are_camel_cased_too() {
+        // K8s spec fields are camelCase by API convention; the
+        // renderer must apply kebab→camel inside :spec too, not just
+        // in values.yaml.
+        let src = r#"
+            (deflava-chart api
+              :version "1.0.0"
+              :manifests
+              ((manifest deployment
+                 :kind Deployment
+                 :api-version apps/v1
+                 :spec (:replicas 1
+                        :selector (:match-labels (:app "api"))
+                        :template
+                        (:spec (:service-account-name "api"
+                                :containers
+                                ((:name  "x"
+                                  :image-pull-policy "IfNotPresent"))))))))
+        "#;
+        let c = &charts_in_source(src).unwrap()[0];
+        let r = render_chart(c).unwrap();
+        let body = &r.templates[0].1;
+        assert!(body.contains("matchLabels"), "matchLabels not found");
+        assert!(body.contains("serviceAccountName"), "serviceAccountName not found");
+        assert!(body.contains("imagePullPolicy"), "imagePullPolicy not found");
+    }
+
+    #[test]
+    fn multi_path_ref_joins_with_colon_for_image_tag_pattern() {
+        let src = r#"
+            (deflava-chart api
+              :version "1.0.0"
+              :manifests
+              ((manifest deployment
+                 :kind Deployment
+                 :api-version apps/v1
+                 :spec (:image (ref :image.repository :image.tag)))))
+        "#;
+        let c = &charts_in_source(src).unwrap()[0];
+        let r = render_chart(c).unwrap();
+        let body = &r.templates[0].1;
+        assert!(
+            body.contains("{{ .Values.image.repository }}:{{ .Values.image.tag }}"),
+            "expected image:tag concat, got: {body}",
+        );
+    }
+
+    #[test]
+    fn true_false_symbols_parse_as_typed_booleans() {
+        let src = r#"
+            (deflava-chart api
+              :version "1.0.0"
+              :values (:enabled true :disabled false))
+        "#;
+        let c = &charts_in_source(src).unwrap()[0];
+        let r = render_chart(c).unwrap();
+        // Typed booleans render as `true` / `false` (not quoted strings).
+        assert!(r.values_yaml.contains("enabled: true"), "{}", r.values_yaml);
+        assert!(r.values_yaml.contains("disabled: false"), "{}", r.values_yaml);
     }
 }
