@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "lava-chart"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "indexmap",
  "lava-eval",

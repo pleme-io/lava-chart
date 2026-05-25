@@ -221,8 +221,15 @@ rec {
       };
       "lava-chart" = rec {
         crateName = "lava-chart";
-        version = "0.1.1";
+        version = "0.2.1";
         edition = "2024";
+        crateBin = [
+          {
+            name = "lava-chart-cli";
+            path = "src/main.rs";
+            requiredFeatures = [ ];
+          }
+        ];
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./.; };
         libName = "lava_chart";
         authors = [
